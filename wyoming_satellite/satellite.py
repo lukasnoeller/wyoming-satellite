@@ -1300,24 +1300,24 @@ class WakeStreamingSatellite(SatelliteBase):
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.write(audio_bytes)
 
-        if ( self.is_streaming
-            and (self.timeout_seconds is not None)
-            and (time.monotonic() >= self.timeout_seconds)
-        ):
-            _LOGGER.debug("Streaming timed out, stopping")
-            # Time out during wake word recognition
-            self.is_streaming = False
-            self.timeout_seconds = None
-
-            # Stop debug recording
-            if self.stt_audio_writer is not None:
-                self.stt_audio_writer.stop()
-
-            # Stop pipeline
-            await self.event_to_server(AudioStop().event())
-
-            _LOGGER.info("Waiting for speech")
-            await self.trigger_streaming_stop()
+        # if ( self.is_streaming
+        #     and (self.timeout_seconds is not None)
+        #     and (time.monotonic() >= self.timeout_seconds)
+        # ):
+        #     _LOGGER.debug("Streaming timed out, stopping")
+        #     # Time out during wake word recognition
+        #     self.is_streaming = False
+        #     self.timeout_seconds = None
+        #
+        #     # Stop debug recording
+        #     if self.stt_audio_writer is not None:
+        #         self.stt_audio_writer.stop()
+        #
+        #     # Stop pipeline
+        #     await self.event_to_server(AudioStop().event())
+        #
+        #     _LOGGER.info("Waiting for speech")
+        #     await self.trigger_streaming_stop()
 
         if self.is_streaming:
             # Forward to server
