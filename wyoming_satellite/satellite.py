@@ -1182,8 +1182,6 @@ class VadStreamingSatellite(SatelliteBase):
 
 
 # -----------------------------------------------------------------------------
-
-
 class WakeStreamingSatellite(SatelliteBase):
     """Satellite that waits for local wake word detection before streaming."""
 
@@ -1193,89 +1191,85 @@ class WakeStreamingSatellite(SatelliteBase):
 
         super().__init__(settings)
         self.is_streaming = False
+        self.is_playing_tts = False
 
-        # Timestamp in the future when the refractory period is over (set with
-        # time.monotonic()).
-        # wake word id -> seconds
+        # Timestamp in the future when the refractory period is over
         self.refractory_timestamp: Dict[Optional[str], float] = {}
-
-        # Timestamp in the future when we will have timed out (set with
-        # time.monotonic())
         self.timeout_seconds: Optional[float] = None
 
         if settings.vad.enabled:
             _LOGGER.warning("VAD is enabled but will not be used")
 
-        # Used for debug audio recording so both wake and stt WAV files have the
-        # same timestamp.
         self._debug_recording_timestamp: Optional[int] = None
-
         self._is_paused = False
-
         self._wake_info: Optional[Info] = None
         self._wake_info_ready = asyncio.Event()
 
-    async def event_from_server(self, event: Event) -> None:
-        # Only check event types once
-        is_run_satellite = False
-        is_pause_satellite = False
-        is_transcript = False
-        is_error = False
+    async def trigger_played(self) -> None:
+        """Called when aplay/snd actually finishes playing sound out of the speaker."""
+        await super().trigger_played()
+        
+        self.is_playing_tts = False
 
+        # Apply the refractory cooldown starting from the exact millisecond audio stopped playing
+        refractory_duration = self.settings.wake.refractory_seconds or 5.0
+        lockout_until = time.monotonic() + refractory_duration
+        for name in list(self.refractory_timestamp.keys()):
+            self.refractory_timestamp[name] = lockout_until
+
+        # Re-arm wake word detection only now that speaker is completely silent
+        if not self._is_paused and not self.is_streaming:
+            await self._send_wake_detect()
+            _LOGGER.info("Waiting for wake word")
+            self._debug_recording_timestamp = time.monotonic_ns()
+            if self.wake_audio_writer is not None:
+                self.wake_audio_writer.start(
+                    timestamp=self._debug_recording_timestamp
+                )
+
+    async def event_from_server(self, event: Event) -> None:
         if RunSatellite.is_type(event.type):
-            is_run_satellite = True
             self._is_paused = False
 
         elif PauseSatellite.is_type(event.type):
-            is_pause_satellite = True
-        elif Transcript.is_type(event.type):
-            is_transcript = True
-        elif Error.is_type(event.type):
-            is_error = True
-
-        if is_transcript or is_pause_satellite:
-            # Stop streaming before event_from_server is called because it will
-            # play the "done" WAV.
+            self._is_paused = True
             self.is_streaming = False
-
-            # Stop debug recording (stt)
+            self.is_playing_tts = False
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.stop()
+            _LOGGER.debug("Satellite is paused")
+
+        elif Transcript.is_type(event.type):
+            # STT done, stop streaming mic to HA
+            self.is_streaming = False
+            if self.stt_audio_writer is not None:
+                self.stt_audio_writer.stop()
+            await self.trigger_streaming_stop()
+
+            # Set refractory cooldown immediately on transcript to prevent instant re-trigger
+            refractory_duration = self.settings.wake.refractory_seconds or 5.0
+            lockout_until = time.monotonic() + refractory_duration
+            for name in list(self.refractory_timestamp.keys()):
+                self.refractory_timestamp[name] = lockout_until
+
+        elif AudioStart.is_type(event.type):
+            self.is_playing_tts = True
+
+        elif Error.is_type(event.type):
+            self.is_streaming = False
+            self.is_playing_tts = False
+            if not self._is_paused:
+                await self._send_wake_detect()
+                _LOGGER.info("Waiting for wake word")
 
         await super().event_from_server(event)
 
-        if is_run_satellite or is_transcript or is_error or is_pause_satellite:
-            # Stop streaming
-            self.is_streaming = False
-
-            if is_pause_satellite:
-                self._is_paused = True
-                _LOGGER.debug("Satellite is paused")
-            else:
-                # Go back to wake word detection
-                await self.trigger_streaming_stop()
-
-                # It's possible to be paused in the middle of streaming
-                if not self._is_paused:
-                    await self._send_wake_detect()
-                    _LOGGER.info("Waiting for wake word")
-
-                    # Start debug recording (wake)
-                    self._debug_recording_timestamp = time.monotonic_ns()
-                    if self.wake_audio_writer is not None:
-                        self.wake_audio_writer.start(
-                            timestamp=self._debug_recording_timestamp
-                        )
-
     async def trigger_server_disonnected(self) -> None:
         await super().trigger_server_disonnected()
-
         self.is_streaming = False
-
-        # Stop debug recording (stt)
+        self.is_playing_tts = False
         if self.stt_audio_writer is not None:
             self.stt_audio_writer.stop()
-
         await self.trigger_streaming_stop()
 
     async def event_from_mic(
@@ -1288,7 +1282,6 @@ class WakeStreamingSatellite(SatelliteBase):
         ):
             return
 
-        # Debug audio recording
         if (self.wake_audio_writer is not None) or (self.stt_audio_writer is not None):
             if audio_bytes is None:
                 chunk = AudioChunk.from_event(event)
@@ -1300,30 +1293,11 @@ class WakeStreamingSatellite(SatelliteBase):
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.write(audio_bytes)
 
-        # if ( self.is_streaming
-        #     and (self.timeout_seconds is not None)
-        #     and (time.monotonic() >= self.timeout_seconds)
-        # ):
-        #     _LOGGER.debug("Streaming timed out, stopping")
-        #     # Time out during wake word recognition
-        #     self.is_streaming = False
-        #     self.timeout_seconds = None
-        #
-        #     # Stop debug recording
-        #     if self.stt_audio_writer is not None:
-        #         self.stt_audio_writer.stop()
-        #
-        #     # Stop pipeline
-        #     await self.event_to_server(AudioStop().event())
-        #
-        #     _LOGGER.info("Waiting for speech")
-        #     await self.trigger_streaming_stop()
-
         if self.is_streaming:
-            # Forward to server
+            # Forward mic to HA
             await self.event_to_server(event)
-        else:
-            # Forward to wake word service
+        elif not self.is_playing_tts:
+            # Only send mic to openWakeWord when not playing TTS
             await self.event_to_wake(event)
 
     async def event_from_wake(self, event: Event) -> None:
@@ -1332,59 +1306,37 @@ class WakeStreamingSatellite(SatelliteBase):
             self._wake_info_ready.set()
             return
 
-        if self.is_streaming or (self.server_id is None):
-            # Not detecting or no server connected
+        if self.is_streaming or self.is_playing_tts or (self.server_id is None):
             return
 
         if Detection.is_type(event.type):
             detection = Detection.from_event(event)
 
-            # Check refractory period to avoid multiple back-to-back detections
+            # Check refractory period
             refractory_timestamp = self.refractory_timestamp.get(detection.name)
             if (refractory_timestamp is not None) and (
                 refractory_timestamp > time.monotonic()
             ):
-                _LOGGER.debug("Wake word detection occurred during refractory period")
+                _LOGGER.debug("Wake word detection occurred during refractory period: %s", detection.name)
                 return
 
-            # Stop debug recording (wake)
             if self.wake_audio_writer is not None:
                 self.wake_audio_writer.stop()
 
-            # Start debug recording (stt)
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.start(timestamp=self._debug_recording_timestamp)
 
             _LOGGER.debug(detection)
-
             self.is_streaming = True
             _LOGGER.debug("Streaming audio")
 
-            if self.settings.wake.refractory_seconds is not None:
-                # Another detection may not occur for this wake word until
-                # refractory period is over.
-                self.refractory_timestamp[detection.name] = (
-                    time.monotonic() + self.settings.wake.refractory_seconds
-                )
-            else:
-                # No refractory period
-                self.refractory_timestamp.pop(detection.name, None)
+            refractory_duration = self.settings.wake.refractory_seconds or 5.0
+            self.refractory_timestamp[detection.name] = (
+                time.monotonic() + refractory_duration
+            )
 
-            # set our timeout window
-            if self.settings.vad.wake_word_timeout is not None:
-                # Set future time when we'll stop streaming if the wake word
-                # hasn't been detected.
-                self.timeout_seconds = (
-                    time.monotonic() + self.settings.vad.wake_word_timeout
-                )
-            else:
-                # No timeout
-                self.timeout_seconds = None
-
-            # Forward to the server
             await self.event_to_server(event)
 
-            # Match detected wake word name with pipeline name
             pipeline_name: Optional[str] = None
             if self.settings.wake.names:
                 detection_name = normalize_wake_word(detection.name)
@@ -1394,7 +1346,7 @@ class WakeStreamingSatellite(SatelliteBase):
                         break
 
             await self._send_run_pipeline(pipeline_name=pipeline_name)
-            await self.forward_event(event)  # forward to event service
+            await self.forward_event(event)
             await self.trigger_detection(Detection.from_event(event))
             await self.trigger_streaming_start()
 
@@ -1407,9 +1359,8 @@ class WakeStreamingSatellite(SatelliteBase):
             await asyncio.wait_for(
                 self._wake_info_ready.wait(), timeout=_WAKE_INFO_TIMEOUT
             )
-
             if self._wake_info is not None:
-                # Update wake info only
                 info.wake = self._wake_info.wake
         except asyncio.TimeoutError:
             _LOGGER.warning("Failed to get info from wake service")
+
